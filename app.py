@@ -4,85 +4,70 @@ import pandas as pd
 from datetime import datetime
 import io
 
-# ---------------------------------------------------------
-# 1. 쿠팡 자동완성 키워드 추출 함수 (강화 버전)
-# ---------------------------------------------------------
 def get_coupang_suggestions(keyword):
     if not keyword:
         return []
     
-    # 쿠팡의 실제 검색창에서 사용하는 최신 API 주소
-    # 'q' 파라미터를 사용하는 최신 엔드포인트로 변경
+    # 1. 쿠팡 최신 자동완성 API 주소
     url = f"https://www.coupang.com/np/search/auto?keyword={keyword}"
     
-    # 쿠팡 서버의 차단을 피하기 위한 상세 헤더 설정
+    # 2. 브라우저인 것처럼 속이기 위한 고도화된 헤더
     headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
         "Referer": "https://www.coupang.com/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "X-Requested-With": "XMLHttpRequest"
+        "X-Requested-With": "XMLHttpRequest",
+        "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin"
     }
     
     try:
-        # verify=True (기본값)로 보안 연결 유지
-        response = requests.get(url, headers=headers, timeout=5)
+        # 세션을 사용하여 쿠키를 자동으로 관리
+        session = requests.Session()
+        # 먼저 메인 페이지에 접속해 기본 쿠키를 확보 (선택 사항이지만 차단 방지에 도움됨)
+        session.get("https://www.coupang.com/", headers={"User-Agent": headers["User-Agent"]}, timeout=5)
+        
+        # 실제 데이터 요청
+        response = session.get(url, headers=headers, timeout=5)
         
         if response.status_code == 200:
             data = response.json()
-            # 데이터 구조 확인: suggest -> 리스트 형태
             if 'suggest' in data and data['suggest']:
-                suggestions = [item.get('keyword') for item in data['suggest']]
-                return suggestions
-            else:
-                # 결과는 성공했으나 추천 검색어가 없는 경우
-                return []
+                return [item.get('keyword') for item in data['suggest']]
+            return []
+        elif response.status_code == 403:
+            return ["error_403"]
         else:
-            return [f"에러 발생 (상태 코드: {response.status_code})"]
+            return [f"에러 발생: {response.status_code}"]
+            
     except Exception as e:
         return [f"연결 오류: {str(e)}"]
 
 # ---------------------------------------------------------
-# 2. 메인 UI
+# Streamlit UI
 # ---------------------------------------------------------
-def main():
-    st.set_page_config(page_title="쿠팡 키워드 추출기", layout="centered")
-    st.title("🔍 쿠팡 자동완성 키워드 추출")
+st.set_page_config(page_title="쿠팡 키워드 우회 추출기")
+st.title("🔍 쿠팡 자동완성 (403 에러 해결 버전)")
 
-    target_keyword = st.text_input("분석할 메인 키워드를 입력하세요", placeholder="예: 캠핑, 자전거, 영양제")
-    
-    if st.button("실시간 연관 키워드 가져오기"):
-        if target_keyword:
-            with st.spinner("쿠팡에서 키워드를 분석 중입니다..."):
-                suggestions = get_coupang_suggestions(target_keyword)
-                
-                if suggestions and not suggestions[0].startswith("에러"):
-                    st.success(f"✅ '{target_keyword}' 관련 추천 검색어를 찾았습니다.")
-                    
-                    # 데이터프레임 구성
-                    df = pd.DataFrame({
-                        "연관 검색어": suggestions
-                    })
-                    
-                    st.table(df) # 깔끔하게 표로 출력
-                    
-                    # 엑셀 다운로드
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                        df.to_excel(writer, index=False)
-                    
-                    st.download_button(
-                        label="📥 엑셀로 저장하기",
-                        data=output.getvalue(),
-                        file_name=f"쿠팡_연관어_{target_keyword}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                elif suggestions and suggestions[0].startswith("에러"):
-                    st.error(suggestions[0])
-                else:
-                    st.warning("데이터가 없습니다. 검색어를 조금 더 짧게(예: '캠핑용' -> '캠핑') 입력해 보세요.")
-        else:
-            st.info("검색어를 입력해 주세요.")
+target_keyword = st.text_input("검색어를 입력하세요", placeholder="예: 캠핑")
 
-if __name__ == "__main__":
-    main()
+if st.button("추출하기"):
+    if target_keyword:
+        with st.spinner("보안 필터 우회 중..."):
+            suggestions = get_coupang_suggestions(target_keyword)
+            
+            if suggestions == ["error_403"]:
+                st.error("🚫 쿠팡 서버가 접속을 차단했습니다 (403 에러).")
+                st.info("💡 **원인:** 너무 잦은 요청이거나 IP가 제한되었습니다.\n**해결:** 잠시 후 다시 시도하거나, 다른 검색어를 입력해 보세요.")
+            elif suggestions and not suggestions[0].startswith("에러"):
+                df = pd.DataFrame({"연관 검색어": suggestions})
+                st.table(df)
+            else:
+                st.warning("데이터가 없거나 다른 에러가 발생했습니다.")
+    else:
+        st.info("키워드를 입력해 주세요.")
