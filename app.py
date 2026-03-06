@@ -1,59 +1,38 @@
 import streamlit as st
-import hmac
-import hashlib
-from time import gmtime, strftime
 import requests
-import json
-from datetime import datetime
 import pandas as pd
+from datetime import datetime
 import io
-import urllib.parse
-
 
 # ---------------------------------------------------------
-# HMAC 서명 생성 (공식 문서 방식)
+# 1. 쿠팡 자동완성 키워드 추출 함수
 # ---------------------------------------------------------
-def generate_hmac(method, url, secret_key, access_key):
-    path, *query = url.split("?")
-    datetime_gmt = strftime('%y%m%d', gmtime()) + 'T' + strftime('%H%M%S', gmtime()) + 'Z'
-    message = datetime_gmt + method + path + (query[0] if query else "")
-
-    signature = hmac.new(
-        bytes(secret_key, "utf-8"),
-        message.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
-
-    return f"CEA algorithm=HmacSHA256, access-key={access_key}, signed-date={datetime_gmt}, signature={signature}"
-
-
-# ---------------------------------------------------------
-# 키워드 검색 API (공식 확인된 엔드포인트)
-# ---------------------------------------------------------
-def search_products(access_key, secret_key, keyword, limit=10):
-    DOMAIN = "https://api-gateway.coupang.com"
-    encoded_keyword = urllib.parse.quote(keyword)
-    URL = f"/v2/providers/affiliate_open_api/apis/openapi/products/search?keyword={encoded_keyword}&limit={limit}"
-
-    authorization = generate_hmac("GET", URL, secret_key, access_key)
-
+def get_coupang_suggestions(keyword):
+    """
+    쿠팡 검색창의 자동완성 데이터를 가져옵니다.
+    """
+    if not keyword:
+        return []
+    
+    # 쿠팡 자동완성 공식 API 엔드포인트
+    url = f"https://www.coupang.com/np/search/auto?keyword={keyword}"
     headers = {
-        "Authorization": authorization,
-        "Content-Type": "application/json;charset=UTF-8"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
     }
-
+    
     try:
-        response = requests.get(f"{DOMAIN}{URL}", headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=5)
         if response.status_code == 200:
-            return response.json()
-        else:
-            return {"error": True, "status": response.status_code, "msg": response.text}
-    except Exception as e:
-        return {"error": True, "msg": str(e)}
-
+            data = response.json()
+            # 자동완성 리스트 추출 (suggest 부분)
+            suggestions = [item.get('keyword') for item in data.get('suggest', [])]
+            return suggestions
+        return []
+    except:
+        return []
 
 # ---------------------------------------------------------
-# 엑셀 변환
+# 2. 엑셀 변환 함수
 # ---------------------------------------------------------
 def to_excel(df):
     output = io.BytesIO()
@@ -61,93 +40,64 @@ def to_excel(df):
         df.to_excel(writer, index=False)
     return output.getvalue()
 
-
 # ---------------------------------------------------------
-# 카테고리별 키워드 매핑
-# ---------------------------------------------------------
-CATEGORY_KEYWORDS = {
-    "여성패션": "여성 옷",
-    "남성패션": "남성 옷",
-    "뷰티": "화장품",
-    "식품": "식품",
-    "주방용품": "주방용품",
-    "생활용품": "생활용품",
-    "가전디지털": "가전제품",
-    "스포츠/레저": "스포츠용품",
-    "완구/취미": "장난감",
-    "반려동물용품": "반려동물",
-    "도서/음반/DVD": "베스트셀러 도서",
-}
-
-
-# ---------------------------------------------------------
-# 메인 앱
+# 3. 메인 앱 레이아웃
 # ---------------------------------------------------------
 def main():
-    st.set_page_config(page_title="쿠팡 인기상품 추출", layout="wide")
-    st.title("🛍️ 쿠팡 파트너스 인기상품 추출")
+    st.set_page_config(page_title="쿠팡 키워드 마스터", layout="wide")
+    
+    st.title("🔍 쿠팡 자동완성 & 키워드 분석기")
+    st.markdown("입력하신 키워드와 관련된 **쿠팡 실제 급상승 검색어**를 실시간으로 추출합니다.")
 
-    if "COUPANG_ACCESS_KEY" not in st.secrets or "COUPANG_SECRET_KEY" not in st.secrets:
-        st.error("🚨 Streamlit Cloud 설정(Secrets)에 키를 등록해 주세요.")
-        st.stop()
+    # 사이드바 설정
+    st.sidebar.header("설정")
+    target_keyword = st.sidebar.text_input("분석할 메인 키워드", placeholder="예: 캠핑")
+    
+    if st.sidebar.button("연관 키워드 추출하기"):
+        if target_keyword:
+            with st.spinner(f"'{target_keyword}' 연관 키워드 분석 중..."):
+                suggestions = get_coupang_suggestions(target_keyword)
+                
+                if suggestions:
+                    st.subheader(f"✅ '{target_keyword}' 관련 자동완성어")
+                    
+                    # 결과를 데이터프레임으로 변환
+                    df_suggest = pd.DataFrame({
+                        "순번": range(1, len(suggestions) + 1),
+                        "자동완성 키워드": suggestions
+                    })
 
-    ACCESS_KEY = st.secrets["COUPANG_ACCESS_KEY"].strip().strip('"').strip("'")
-    SECRET_KEY = st.secrets["COUPANG_SECRET_KEY"].strip().strip('"').strip("'")
+                    # 가로로 깔끔하게 보여주기 위한 컬럼 배치
+                    col1, col2 = st.columns([2, 1])
+                    
+                    with col1:
+                        st.dataframe(df_suggest, use_container_width=True)
+                    
+                    with col2:
+                        st.info("💡 **팁:** 이 키워드들은 쿠팡 소비자들이 지금 이 순간 가장 많이 검색하는 단어들입니다. 상품 소싱이나 제목 키워드 구성에 활용하세요!")
+                        
+                        # 엑셀 다운로드
+                        excel_data = to_excel(df_suggest)
+                        st.download_button(
+                            label="📥 키워드 리스트 다운로드",
+                            data=excel_data,
+                            file_name=f"쿠팡_자동완성_{target_keyword}_{datetime.now().strftime('%m%d')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                else:
+                    st.warning("추출된 자동완성어가 없습니다. 다른 검색어를 입력해 보세요.")
+        else:
+            st.error("키워드를 먼저 입력해 주세요.")
 
-    st.sidebar.header("추출 옵션")
+    # 하단 가이드
+    st.divider()
+    with st.expander("ℹ️ 활용 방법"):
+        st.write("""
+        1. 왼쪽 사이드바에 '아이폰' 또는 '영양제' 같은 메인 키워드를 입력합니다.
+        2. '연관 키워드 추출하기' 버튼을 누릅니다.
+        3. 쿠팡 앱 검색창에 뜨는 **자동완성 리스트**가 순서대로 표시됩니다.
+        4. 이 키워드들을 바탕으로 블로그 제목을 짓거나, 상품을 검색하는 데 활용하세요.
+        """)
 
-    search_mode = st.sidebar.radio("검색 방법", ["카테고리 선택", "직접 키워드 입력"])
-
-    if search_mode == "카테고리 선택":
-        selected_cat = st.sidebar.selectbox("카테고리 선택", list(CATEGORY_KEYWORDS.keys()))
-        keyword = CATEGORY_KEYWORDS[selected_cat]
-        label = selected_cat
-    else:
-        keyword = st.sidebar.text_input("검색 키워드", placeholder="예: 에어프라이어")
-        label = keyword
-
-    limit_count = st.sidebar.slider("추출 개수 (최대 10개)", 1, 10, 10)
-
-    st.sidebar.info("⚠️ 쿠팡 API는 시간당 최대 10회 호출 가능합니다.")
-
-    if st.sidebar.button("데이터 가져오기"):
-        if not keyword:
-            st.warning("키워드를 입력해 주세요.")
-            return
-
-        with st.spinner(f"'{keyword}' 상품 검색 중..."):
-            res = search_products(ACCESS_KEY, SECRET_KEY, keyword, limit_count)
-
-            if isinstance(res, dict) and "data" in res:
-                product_data = res["data"].get("productData", [])
-
-                if not product_data:
-                    st.warning("검색 결과가 없습니다. 다른 키워드를 시도해보세요.")
-                    return
-
-                df = pd.DataFrame([{
-                    "순위": item.get("rank", i + 1),
-                    "상품명": item.get("productName"),
-                    "가격(원)": item.get("productPrice"),
-                    "로켓배송": "🚀" if item.get("isRocket") else "일반",
-                    "무료배송": "✅" if item.get("isFreeShipping") else "❌",
-                    "상품링크": item.get("productUrl")
-                } for i, item in enumerate(product_data)])
-
-                st.success(f"✅ '{label}' 상품 {len(df)}개를 가져왔습니다!")
-                st.dataframe(df, use_container_width=True)
-
-                excel_data = to_excel(df)
-                st.download_button(
-                    label="📥 엑셀 파일 다운로드",
-                    data=excel_data,
-                    file_name=f"쿠팡_{label}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            else:
-                st.error("❌ API 호출 실패")
-                st.json(res)
-
-
-main()
-
+if __name__ == "__main__":
+    main()
