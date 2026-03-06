@@ -3,126 +3,229 @@ import hmac
 import hashlib
 from time import gmtime, strftime
 import requests
+from datetime import datetime
 import pandas as pd
+import io
 import urllib.parse
-import re
-from collections import Counter
+import json
+
 
 # ---------------------------------------------------------
-# 1. HMAC 서명 생성 (공식 인증)
+# HMAC 서명 생성
 # ---------------------------------------------------------
 def generate_hmac(method, url, secret_key, access_key):
     path, *query = url.split("?")
     datetime_gmt = strftime('%y%m%d', gmtime()) + 'T' + strftime('%H%M%S', gmtime()) + 'Z'
     message = datetime_gmt + method + path + (query[0] if query else "")
-    signature = hmac.new(bytes(secret_key, "utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+    signature = hmac.new(
+        bytes(secret_key, "utf-8"),
+        message.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
     return f"CEA algorithm=HmacSHA256, access-key={access_key}, signed-date={datetime_gmt}, signature={signature}"
 
-# ---------------------------------------------------------
-# 2. 핵심 로직: 상위 10개 상품에서 키워드 추출
-# ---------------------------------------------------------
-def extract_keywords_from_products(products, original_keyword):
-    """
-    상품명 10개에서 핵심 단어를 뽑아 자동완성어 리스트를 만듭니다.
-    """
-    word_list = []
-    
-    # 검색어 자체나 의미 없는 단어 제거
-    stop_words = [original_keyword, "쿠팡", "로켓배송", "무료배송", "정품", "국산", "세트", "상품", "추천", "개입", "브랜드", "모델", "호환"]
-    # 검색어에 포함된 단어들도 제외 (예: '여성 니트' 검색 시 '여성', '니트' 제외)
-    stop_words.extend(original_keyword.split())
-
-    for item in products:
-        name = item.get("productName", "")
-        # 특수문자 제거 후 공백 기준 분리
-        # 가-힣(한글), a-zA-Z(영어), 0-9(숫자)만 남김
-        clean_name = re.sub(r'[^가-힣a-zA-Z0-9\s]', ' ', name)
-        words = clean_name.split()
-        
-        for w in words:
-            # 2글자 이상이고, 숫자가 아니며, 금지어가 아닌 것만
-            if len(w) >= 2 and not w.isdigit() and w not in stop_words:
-                word_list.append(w)
-
-    # 빈도수가 높은 순서대로 정렬하여 중복 제거
-    # 상위 10개 상품이므로 데이터가 적어서, 1번만 등장해도 리스트에 포함
-    counts = Counter(word_list)
-    
-    # 많이 등장한 순서대로 정렬된 키워드 리스트 반환
-    return [word for word, count in counts.most_common(10)]
 
 # ---------------------------------------------------------
-# 3. 메인 앱
+# 쿠팡 연관검색어 추출 (자동완성 API)
+# ---------------------------------------------------------
+def get_related_keywords(keyword, limit=10):
+    encoded = urllib.parse.quote(keyword)
+    url = f"https://www.coupang.com/np/search/suggest?callback=&searchTerm={encoded}&_={int(datetime.now().timestamp()*1000)}"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://www.coupang.com/",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            text = response.text.strip()
+            # JSONP 형식 처리 (콜백 함수로 감싸진 경우)
+            if text.startswith("(") and text.endswith(")"):
+                text = text[1:-1]
+            elif "(" in text and text.endswith(")"):
+                text = text[text.index("(")+1:-1]
+
+            data = json.loads(text)
+
+            # 응답 구조에서 키워드 추출
+            suggestions = []
+            if isinstance(data, dict):
+                # 가능한 여러 키 시도
+                for key in ["suggests", "suggestions", "data", "result", "keywords"]:
+                    if key in data:
+                        raw = data[key]
+                        if isinstance(raw, list):
+                            for item in raw:
+                                if isinstance(item, str):
+                                    suggestions.append(item)
+                                elif isinstance(item, dict):
+                                    for k in ["keyword", "text", "value", "name", "query"]:
+                                        if k in item:
+                                            suggestions.append(item[k])
+                                            break
+                        break
+            elif isinstance(data, list):
+                for item in data:
+                    if isinstance(item, str):
+                        suggestions.append(item)
+                    elif isinstance(item, dict):
+                        for k in ["keyword", "text", "value", "name", "query"]:
+                            if k in item:
+                                suggestions.append(item[k])
+                                break
+
+            return {"success": True, "keywords": suggestions[:limit], "raw": data}
+        else:
+            return {"success": False, "error": f"HTTP {response.status_code}", "raw": response.text}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ---------------------------------------------------------
+# 쿠팡 파트너스 상품 검색 API
+# ---------------------------------------------------------
+def search_products(access_key, secret_key, keyword, limit=10):
+    DOMAIN = "https://api-gateway.coupang.com"
+    encoded_keyword = urllib.parse.quote(keyword)
+    URL = f"/v2/providers/affiliate_open_api/apis/openapi/products/search?keyword={encoded_keyword}&limit={limit}"
+    authorization = generate_hmac("GET", URL, secret_key, access_key)
+    headers = {
+        "Authorization": authorization,
+        "Content-Type": "application/json;charset=UTF-8"
+    }
+    try:
+        response = requests.get(f"{DOMAIN}{URL}", headers=headers, timeout=10)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return {"error": True, "status": response.status_code, "msg": response.text}
+    except Exception as e:
+        return {"error": True, "msg": str(e)}
+
+
+# ---------------------------------------------------------
+# 엑셀 변환
+# ---------------------------------------------------------
+def to_excel(df):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False)
+    return output.getvalue()
+
+
+# ---------------------------------------------------------
+# 메인 앱
 # ---------------------------------------------------------
 def main():
-    st.set_page_config(page_title="쿠팡 연관어 추출기", layout="centered")
-    st.title("🛡️ 쿠팡 API 공식 연관 키워드 추출")
-    st.info("공식 API(limit=10)를 사용하여 안전하게 연관 검색어를 생성합니다.")
+    st.set_page_config(page_title="쿠팡 키워드 분석", layout="wide")
+    st.title("🛍️ 쿠팡 연관검색어 & 인기상품 추출기")
 
-    # Secrets 체크 및 로드
-    if "COUPANG_ACCESS_KEY" not in st.secrets:
-        st.error("Secrets 설정이 필요합니다.")
+    if "COUPANG_ACCESS_KEY" not in st.secrets or "COUPANG_SECRET_KEY" not in st.secrets:
+        st.error("🚨 Streamlit Cloud 설정(Secrets)에 키를 등록해 주세요.")
         st.stop()
-        
+
     ACCESS_KEY = st.secrets["COUPANG_ACCESS_KEY"].strip().strip('"').strip("'")
     SECRET_KEY = st.secrets["COUPANG_SECRET_KEY"].strip().strip('"').strip("'")
 
-    keyword = st.text_input("검색어를 입력하세요", placeholder="예: 캠핑 의자")
+    # 탭 구성
+    tab1, tab2 = st.tabs(["🔍 연관검색어 추출", "📦 인기상품 추출"])
 
-    if st.button("연관어 추출하기"):
-        if not keyword:
-            st.warning("키워드를 입력해주세요.")
-            return
+    # ── 탭1: 연관검색어 ──
+    with tab1:
+        st.subheader("🔍 쿠팡 연관검색어 추출")
+        st.caption("쿠팡 검색창 자동완성 기반으로 연관검색어를 추출합니다.")
 
-        with st.spinner(f"'{keyword}' 관련 데이터를 분석 중입니다..."):
-            DOMAIN = "https://api-gateway.coupang.com"
-            # ✅ [수정 완료] limit=10 으로 고정 (에러 해결 핵심)
-            URL = f"/v2/providers/affiliate_open_api/apis/openapi/products/search?keyword={urllib.parse.quote(keyword)}&limit=10"
-            
-            auth = generate_hmac("GET", URL, SECRET_KEY, ACCESS_KEY)
-            headers = {
-                "Authorization": auth,
-                "Content-Type": "application/json;charset=UTF-8",
-                "x-requested-with": "openapi"
-            }
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            keyword_input = st.text_input("검색 키워드 입력", placeholder="예: 여성 니트티", key="kw1")
+        with col2:
+            limit_kw = st.number_input("추출 수량", min_value=1, max_value=20, value=10)
 
-            try:
-                response = requests.get(DOMAIN + URL, headers=headers, timeout=10)
-                res_data = response.json()
+        if st.button("연관검색어 추출", type="primary"):
+            if not keyword_input.strip():
+                st.warning("키워드를 입력해 주세요.")
+            else:
+                with st.spinner(f"'{keyword_input}' 연관검색어 추출 중..."):
+                    result = get_related_keywords(keyword_input.strip(), limit_kw)
 
-                if response.status_code == 200 and "data" in res_data:
-                    products = res_data["data"].get("productData", [])
-                    
-                    if products:
-                        # 키워드 추출 함수 실행
-                        extracted = extract_keywords_from_products(products, keyword)
-                        
-                        st.success("✅ 추출 완료! (자동완성 추천)")
-                        
-                        if extracted:
-                            # 1. 텍스트 리스트 형태로 보여주기 (복사하기 좋게)
-                            st.markdown("### 📋 추천 키워드 리스트")
-                            st.code(", ".join(extracted))
+                if result["success"]:
+                    keywords = result["keywords"]
+                    if keywords:
+                        st.success(f"✅ '{keyword_input}' 연관검색어 {len(keywords)}개 추출 완료!")
 
-                            # 2. 깔끔한 테이블로 보여주기
-                            df = pd.DataFrame(extracted, columns=["연관 키워드"])
-                            df.index = df.index + 1
-                            st.dataframe(df, use_container_width=True)
-                        else:
-                            st.warning("연관 키워드를 추출할 만큼 충분한 데이터가 없습니다.")
+                        df_kw = pd.DataFrame({
+                            "순번": range(1, len(keywords) + 1),
+                            "연관검색어": keywords
+                        })
+                        st.dataframe(df_kw, use_container_width=True, hide_index=True)
 
-                        st.divider()
-                        with st.expander("분석에 사용된 원본 상품명 보기 (증빙용)"):
-                            for p in products:
-                                st.text(f"- {p['productName']}")
+                        excel_data = to_excel(df_kw)
+                        st.download_button(
+                            label="📥 연관검색어 엑셀 다운로드",
+                            data=excel_data,
+                            file_name=f"쿠팡_연관검색어_{keyword_input}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
                     else:
-                        st.warning("검색된 상품이 없습니다.")
+                        st.warning("연관검색어를 찾을 수 없습니다.")
+                        with st.expander("🔧 디버그 정보 (원본 응답)"):
+                            st.json(result.get("raw", {}))
                 else:
-                    # 또 다른 에러가 있다면 메시지 출력
-                    st.error(f"API 오류: {res_data.get('rMessage', '알 수 없는 오류')}")
-            
-            except Exception as e:
-                st.error(f"시스템 오류: {str(e)}")
+                    st.error(f"❌ 추출 실패: {result.get('error')}")
+                    with st.expander("🔧 디버그 정보"):
+                        st.write(result.get("raw", ""))
 
-if __name__ == "__main__":
-    main()
+    # ── 탭2: 인기상품 ──
+    with tab2:
+        st.subheader("📦 쿠팡 파트너스 상품 검색")
+        st.caption("쿠팡 파트너스 API를 통해 키워드별 인기상품을 가져옵니다.")
+
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            keyword_prod = st.text_input("검색 키워드 입력", placeholder="예: 에어프라이어", key="kw2")
+        with col2:
+            limit_prod = st.slider("추출 개수", 1, 10, 10)
+
+        st.info("⚠️ 쿠팡 파트너스 Search API는 시간당 최대 10회 호출 가능합니다.")
+
+        if st.button("상품 검색", type="primary"):
+            if not keyword_prod.strip():
+                st.warning("키워드를 입력해 주세요.")
+            else:
+                with st.spinner(f"'{keyword_prod}' 상품 검색 중..."):
+                    res = search_products(ACCESS_KEY, SECRET_KEY, keyword_prod.strip(), limit_prod)
+
+                if isinstance(res, dict) and "data" in res:
+                    product_data = res["data"].get("productData", [])
+                    if not product_data:
+                        st.warning("검색 결과가 없습니다.")
+                    else:
+                        df_prod = pd.DataFrame([{
+                            "순위": item.get("rank", i + 1),
+                            "상품명": item.get("productName"),
+                            "가격(원)": item.get("productPrice"),
+                            "로켓배송": "🚀" if item.get("isRocket") else "일반",
+                            "무료배송": "✅" if item.get("isFreeShipping") else "❌",
+                            "상품링크": item.get("productUrl")
+                        } for i, item in enumerate(product_data)])
+
+                        st.success(f"✅ '{keyword_prod}' 상품 {len(df_prod)}개 추출 완료!")
+                        st.dataframe(df_prod, use_container_width=True, hide_index=True)
+
+                        excel_data = to_excel(df_prod)
+                        st.download_button(
+                            label="📥 상품 엑셀 다운로드",
+                            data=excel_data,
+                            file_name=f"쿠팡_상품_{keyword_prod}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                else:
+                    st.error("❌ API 호출 실패")
+                    st.json(res)
+
+
+main()
