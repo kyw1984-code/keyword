@@ -49,108 +49,113 @@ def search_products(access_key, secret_key, keyword, limit=10):
 
 
 # ---------------------------------------------------------
-# 상품명 전처리: 노이즈 제거
+# 유사 단어 판별: A가 B에 포함되거나 B가 A에 포함되면 동일 취급
+# 예) "니트" ↔ "니트티", "여자" ↔ "여성" 같은 포함 관계
+# ---------------------------------------------------------
+def is_similar_word(word_a, word_b):
+    a, b = word_a.lower(), word_b.lower()
+    if a == b:
+        return True
+    # 한쪽이 다른쪽을 포함하는 경우 (예: 니트 ⊂ 니트티)
+    if a in b or b in a:
+        return True
+    return False
+
+
+def has_overlap_with_existing(candidate_words, seen_word_list):
+    """후보 단어들이 기존 추가된 단어들과 유사한지 확인"""
+    for cw in candidate_words:
+        for sw in seen_word_list:
+            if is_similar_word(cw, sw):
+                return True
+    return False
+
+
+# ---------------------------------------------------------
+# 상품명 전처리
 # ---------------------------------------------------------
 def clean_product_name(name):
-    # 특수문자, 숫자+단위, 영문 단독 제거
-    name = re.sub(r'\[.*?\]|\(.*?\)|【.*?】|《.*?》', ' ', name)   # 괄호 안 내용 제거
-    name = re.sub(r'\d+[\w%]*', ' ', name)                         # 숫자+단위 제거
-    name = re.sub(r'[^가-힣a-zA-Z\s]', ' ', name)                  # 특수문자 제거
-    name = re.sub(r'\b[a-zA-Z]{1,2}\b', ' ', name)                 # 1~2자리 영문 제거
+    name = re.sub(r'\[.*?\]|\(.*?\)|【.*?】|《.*?》', ' ', name)
+    name = re.sub(r'\d+[\w%]*', ' ', name)
+    name = re.sub(r'[^가-힣a-zA-Z\s]', ' ', name)
+    name = re.sub(r'\b[a-zA-Z]{1,2}\b', ' ', name)
     name = re.sub(r'\s+', ' ', name).strip()
     return name
 
 
 # ---------------------------------------------------------
-# 연관 키워드 추출 (정교화 버전)
+# 연관 키워드 추출 (유사어 중복 제거 강화)
 # ---------------------------------------------------------
 def extract_keywords(base_keyword, product_names, limit=10):
 
-    # 불용어 (마케팅 용어, 조사, 단위 등)
     STOPWORDS = {
-        # 조사/어미
         "이", "가", "을", "를", "의", "에", "에서", "은", "는", "과", "와", "도",
         "로", "으로", "만", "까지", "부터", "이나", "이라", "하고",
-        # 마케팅/배송 단어
         "무료", "배송", "할인", "특가", "신상", "베스트", "추천", "인기", "최저가",
         "당일", "빠른", "정품", "국내", "해외", "직구", "공식", "브랜드", "신제품",
         "세일", "쿠폰", "증정", "사은품", "기획", "한정", "단독",
-        # 수량/단위
         "개", "팩", "세트", "묶음", "박스", "장", "켤레", "쌍", "벌",
-        # 범용 형용사
         "좋은", "예쁜", "귀여운", "심플", "고급", "프리미엄", "캐주얼",
-        # 기타
         "cm", "mm", "ml", "kg", "the", "and", "for", "with", "new", "best"
     }
 
-    # 기본 키워드를 단어 단위로 분리
-    base_words = set(re.findall(r'[가-힣a-zA-Z]{2,}', base_keyword.strip()))
+    # 기본 키워드 단어 분리 (유사어 비교에 사용)
+    base_words = re.findall(r'[가-힣a-zA-Z]{2,}', base_keyword.strip())
 
-    # 상품명 전처리 및 토큰화
     all_tokens = []
-    bigrams = []  # 2단어 연속 조합
+    bigrams = []
 
     for name in product_names:
         cleaned = clean_product_name(name)
-        tokens = [t for t in cleaned.split() if len(t) >= 2 and t.lower() not in STOPWORDS]
+        tokens = [t for t in cleaned.split()
+                  if len(t) >= 2 and t.lower() not in STOPWORDS]
 
-        # 기본 키워드 단어 자체는 단독 토큰에서 제거 (중복 방지)
-        filtered = [t for t in tokens if t not in base_words]
+        # 기본 키워드와 유사한 단어 제거 (예: 기본이 "니트티"면 "니트"도 제거)
+        filtered = []
+        for t in tokens:
+            if not any(is_similar_word(t, bw) for bw in base_words):
+                filtered.append(t)
+
         all_tokens.extend(filtered)
 
-        # 2단어 연속 조합 (bigram) 생성
         for i in range(len(filtered) - 1):
             bigram = f"{filtered[i]} {filtered[i+1]}"
             bigrams.append(bigram)
 
-    # 빈도 계산
     token_counter = Counter(all_tokens)
     bigram_counter = Counter(bigrams)
 
-    # 후보 키워드 풀 구성
-    # 우선순위: bigram(2단어 조합) > 단일 단어
+    # 후보 풀 구성 (bigram 우선)
     candidates = []
-
-    # 1순위: 2회 이상 등장한 bigram
-    for bigram, count in bigram_counter.most_common(50):
+    for bigram, count in bigram_counter.most_common(80):
         if count >= 2:
             candidates.append(bigram)
-
-    # 2순위: 2회 이상 등장한 단일 단어
-    for word, count in token_counter.most_common(50):
+    for word, count in token_counter.most_common(80):
         if count >= 2:
             candidates.append(word)
-
-    # 3순위: 1회 등장 단일 단어 (후보 부족할 경우 보충)
-    for word, count in token_counter.most_common(50):
+    for word, count in token_counter.most_common(80):
         if count == 1:
             candidates.append(word)
 
-    # 중복 제거 (순서 유지)
-    seen_words = set()
-    unique_candidates = []
-    for c in candidates:
-        key = c.lower()
-        # 이미 추가된 단어가 포함된 후보는 제외 (중복 의미 방지)
-        words_in_c = set(c.lower().split())
-        if not words_in_c & seen_words:
-            unique_candidates.append(c)
-            seen_words.update(words_in_c)
+    # 중복/유사어 제거하며 최종 키워드 선정
+    seen_word_list = list(base_words)  # 기본 키워드 단어도 seen에 포함
+    final_keywords = []
 
-    # 최종 연관검색어: "기본키워드 + 후보" 조합
-    base = base_keyword.strip()
-    related = []
-    added_suffixes = set()
+    for candidate in candidates:
+        cand_words = re.findall(r'[가-힣a-zA-Z]{2,}', candidate)
 
-    for candidate in unique_candidates:
-        suffix_key = candidate.lower()
-        if suffix_key not in added_suffixes:
-            related.append(f"{base} {candidate}")
-            added_suffixes.add(suffix_key)
-        if len(related) >= limit:
+        # 후보 단어가 기존 seen 단어와 유사하면 스킵
+        if has_overlap_with_existing(cand_words, seen_word_list):
+            continue
+
+        base = base_keyword.strip()
+        final_keywords.append(f"{base} {candidate}")
+        seen_word_list.extend(cand_words)  # 추가된 단어를 seen에 등록
+
+        if len(final_keywords) >= limit:
             break
 
-    return related[:limit]
+    return final_keywords
 
 
 # ---------------------------------------------------------
@@ -185,7 +190,7 @@ def main():
     # ── 탭1: 연관검색어 ──
     with tab1:
         st.subheader("🔍 쿠팡 연관검색어 추출")
-        st.caption("실제 쿠팡 상품명 데이터를 분석해 중복 없이 연관검색어를 추출합니다.")
+        st.caption("실제 쿠팡 상품명을 분석하여 유사 단어 중복 없이 연관검색어를 추출합니다.")
 
         col1, col2 = st.columns([3, 1])
         with col1:
@@ -218,7 +223,7 @@ def main():
                             st.dataframe(df_kw, use_container_width=True, hide_index=True)
 
                             st.divider()
-                            st.caption("💡 키워드 클릭 시 인기상품 탭에서 바로 검색됩니다.")
+                            st.caption("💡 키워드 클릭 시 인기상품 탭에서 바로 검색할 수 있습니다.")
                             cols = st.columns(5)
                             for i, kw in enumerate(keywords):
                                 with cols[i % 5]:
@@ -238,7 +243,7 @@ def main():
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                             )
                         else:
-                            st.warning("연관검색어를 추출하지 못했습니다. 다른 키워드로 시도해보세요.")
+                            st.warning("추출된 연관검색어가 없습니다. 다른 키워드로 시도해보세요.")
                 else:
                     st.error("❌ API 호출 실패")
                     st.json(res)
