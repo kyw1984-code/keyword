@@ -31,9 +31,7 @@ def generate_hmac(method, url, secret_key, access_key):
 def search_products(access_key, secret_key, keyword, limit=10):
     DOMAIN = "https://api-gateway.coupang.com"
     encoded_keyword = urllib.parse.quote(keyword)
-    
-    # [핵심 수정] 사용자가 숫자를 크게 입력해도 API로는 무조건 10개만 요청하여 에러 방지
-    safe_limit = 10 if int(limit) > 10 else int(limit)
+    safe_limit = 10 if int(limit) > 10 else int(limit) # 안전장치
     
     URL = f"/v2/providers/affiliate_open_api/apis/openapi/products/search?keyword={encoded_keyword}&limit={safe_limit}"
     
@@ -54,93 +52,88 @@ def search_products(access_key, secret_key, keyword, limit=10):
 
 
 # ---------------------------------------------------------
-# 텍스트 전처리 및 N-gram 추출 (자동완성어 로직 강화)
+# [핵심 수정] 하이브리드 키워드 추출 (무조건 추출 보장)
 # ---------------------------------------------------------
 def clean_text(text):
-    """특수문자 제거 및 텍스트 정규화"""
     text = re.sub(r'\[.*?\]|\(.*?\)|<.*?>|【.*?】', ' ', text)
     text = re.sub(r'[^가-힣a-zA-Z0-9\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-def extract_auto_complete_like_keywords(base_keyword, product_names, limit=10):
+def extract_hybrid_keywords(base_keyword, product_names, limit=10):
     """
-    상품명에서 '검색어 + @' 패턴을 우선적으로 찾아 자동완성어와 유사하게 만듭니다.
+    1. 검색어를 포함하는 연관 문구 (1순위)
+    2. 자주 등장하는 2단어 조합 (2순위)
+    3. 자주 등장하는 단일 핵심 키워드 (3순위 - 비상용)
+    위 3단계를 거쳐 limit 개수를 무조건 채웁니다.
     """
     STOPWORDS = {
         "무료배송", "로켓배송", "국내생산", "정품", "당일발송", "특가", "할인", "쿠팡", 
         "브랜드", "세트", "상품", "추천", "인기", "신상", "최저가", "기획", "모음",
-        "개입", "box", "박스", "1개", "x", "및", "의", "용", "대형", "소형", "사이즈"
+        "개입", "box", "박스", "1개", "x", "및", "의", "용", "대형", "소형", "사이즈",
+        "남녀공용", "겸용", "스타일", "컬러"
     }
+    
+    # 검색어 자체도 중복 방지를 위해 제외 목록에 추가
+    base_parts = base_keyword.split()
+    for bp in base_parts:
+        STOPWORDS.add(bp)
 
     base_clean = base_keyword.replace(" ", "")
-    candidates = []
+    
+    phrases = [] # 2~3단어 묶음
+    words = []   # 1단어
 
     for name in product_names:
         cleaned_name = clean_text(name)
         tokens = cleaned_name.split()
         
+        # 단일 단어 수집
+        for t in tokens:
+            if len(t) > 1 and t not in STOPWORDS:
+                words.append(t)
+
         if len(tokens) < 2: continue
 
-        grams = []
-        # 2단어 조합 (Bigram)
+        # N-gram 수집 (2단어 조합)
         for i in range(len(tokens) - 1):
-            grams.append(f"{tokens[i]} {tokens[i+1]}")
-        # 3단어 조합 (Trigram)
-        for i in range(len(tokens) - 2):
-            grams.append(f"{tokens[i]} {tokens[i+1]} {tokens[i+2]}")
+            gram = f"{tokens[i]} {tokens[i+1]}"
+            if not any(stop in gram for stop in STOPWORDS):
+                phrases.append(gram)
 
-        for gram in grams:
-            if any(stop in gram for stop in STOPWORDS): continue
-            
-            # [로직 강화] 검색어가 문구의 '앞부분'에 위치할수록 가중치를 둠 (실제 자동완성 특징)
-            gram_nospace = gram.replace(" ", "")
-            if base_clean in gram_nospace:
-                candidates.append(gram)
-
-    # 빈도수 분석
-    counter = Counter(candidates)
-    
-    # 정렬 기준: 1. 빈도수 높은 순, 2. 검색어로 시작하는 단어 우선, 3. 짧은 길이 우선
-    def sort_key(item):
-        kw, count = item
-        starts_with_keyword = kw.replace(" ", "").startswith(base_clean)
-        return (-count, -starts_with_keyword, len(kw))
-
-    sorted_keywords = sorted(counter.most_common(), key=sort_key)
+    # 빈도수 계산
+    phrase_counts = Counter(phrases).most_common()
+    word_counts = Counter(words).most_common()
 
     final_keywords = []
     seen = set()
-    # 원본 검색어 자체는 제외
-    seen.add(base_keyword.replace(" ", ""))
+    seen.add(base_clean)
+    
+    # 전략 1: 검색어가 포함된 문구 우선 추출
+    for phrase, count in phrase_counts:
+        p_nospace = phrase.replace(" ", "")
+        if base_clean in p_nospace and p_nospace not in seen:
+            final_keywords.append(phrase)
+            seen.add(p_nospace)
 
-    for kw, count in sorted_keywords:
-        kw_clean = kw.replace(" ", "")
-        
-        # 중복 제거 (포함 관계가 너무 명확하면 긴 것만 남기거나 하는 식으로 조절 가능하나 여기선 단순 중복 체크)
-        if kw_clean not in seen:
-            final_keywords.append(kw)
-            seen.add(kw_clean)
-            
-        if len(final_keywords) >= limit:
-            break
-            
-    # 결과가 부족할 경우 단순 포함 단어로 채우기
+    # 전략 2: 검색어가 없더라도 자주 나오는 문구 추출 (빈도 2 이상)
     if len(final_keywords) < limit:
-        simple_tokens = []
-        for name in product_names:
-            for t in clean_text(name).split():
-                if base_clean in t and t not in seen and t not in STOPWORDS:
-                    simple_tokens.append(t)
-        
-        for kw, _ in Counter(simple_tokens).most_common():
-            if kw not in seen:
-                final_keywords.append(kw)
-                seen.add(kw)
+        for phrase, count in phrase_counts:
+            p_nospace = phrase.replace(" ", "")
+            if p_nospace not in seen and count >= 2: # 최소 2번 이상 등장한 문구
+                final_keywords.append(phrase)
+                seen.add(p_nospace)
+                
+    # 전략 3: 그래도 부족하면 자주 나오는 단어(명사)로 채우기 (무조건 채워짐)
+    if len(final_keywords) < limit:
+        for word, count in word_counts:
+            if word not in seen and word not in STOPWORDS:
+                final_keywords.append(word)
+                seen.add(word)
             if len(final_keywords) >= limit:
                 break
-
-    return final_keywords
+    
+    return final_keywords[:limit]
 
 
 # ---------------------------------------------------------
@@ -160,7 +153,6 @@ def main():
     st.set_page_config(page_title="쿠팡 키워드 분석기", layout="wide")
     st.title("🛍️ 쿠팡 연관검색어 & 인기상품 추출기")
 
-    # Secrets 확인
     if "COUPANG_ACCESS_KEY" not in st.secrets or "COUPANG_SECRET_KEY" not in st.secrets:
         st.error("🚨 Streamlit Secrets에 키 설정을 확인해주세요.")
         st.stop()
@@ -177,7 +169,6 @@ def main():
         with col1:
             keyword_input = st.text_input("검색 키워드 입력", placeholder="예: 여성 니트", key="kw1")
         with col2:
-            # [UI 수정] 최대값을 10으로 제한하여 사용자 실수 방지
             limit_kw = st.number_input("추출 수량", min_value=1, max_value=10, value=10)
 
         if st.button("🔍 연관검색어 추출", type="primary", use_container_width=True):
@@ -185,7 +176,7 @@ def main():
                 st.warning("키워드를 입력해 주세요.")
             else:
                 with st.spinner(f"'{keyword_input}' 분석 중..."):
-                    # [코드 수정] API 호출 시 limit=10으로 고정
+                    # Limit 10 고정
                     res = search_products(ACCESS_KEY, SECRET_KEY, keyword_input.strip(), 10)
 
                 if isinstance(res, dict) and "data" in res:
@@ -194,7 +185,9 @@ def main():
                         st.warning("검색 결과가 없습니다.")
                     else:
                         product_names = [item.get("productName", "") for item in product_data]
-                        keywords = extract_auto_complete_like_keywords(keyword_input.strip(), product_names, limit_kw)
+                        
+                        # [변경] 하이브리드 추출 함수 사용
+                        keywords = extract_hybrid_keywords(keyword_input.strip(), product_names, limit_kw)
 
                         if keywords:
                             st.success(f"✅ 연관검색어 추출 완료!")
@@ -209,7 +202,6 @@ def main():
                                         st.session_state["search_keyword"] = kw
                                         st.info(f"👉 '인기상품 검색' 탭에서 확인하세요!")
                             
-                            # 엑셀 다운로드
                             excel_data = to_excel(df_kw)
                             st.download_button(
                                 "📥 연관검색어 엑셀 다운로드",
@@ -217,10 +209,11 @@ def main():
                                 file_name=f"연관검색어_{keyword_input}.xlsx"
                             )
                         else:
-                            st.warning("추출된 키워드가 없습니다.")
+                            # 10개 상품이 있는데도 키워드가 안 뽑히는 경우는 거의 없음 (단어로라도 채움)
+                            st.warning("특이사항: 추출된 단어가 없습니다. 상품명을 확인해보세요.")
+                            st.write(product_names)
                 else:
                     st.error("❌ API 호출 실패")
-                    st.write("▼ 상세 에러 내용")
                     st.json(res)
 
     # ── 탭2: 인기상품 ──
@@ -232,7 +225,6 @@ def main():
         with col1:
             keyword_prod = st.text_input("상품 검색", value=default_kw, key="kw2")
         with col2:
-            # [UI 수정] 슬라이더 최대값도 10으로 제한
             limit_prod = st.slider("개수", 1, 10, 10)
 
         if st.button("🛒 상품 검색", type="primary", use_container_width=True):
@@ -240,7 +232,6 @@ def main():
                 st.warning("키워드를 입력하세요.")
             else:
                 with st.spinner("검색 중..."):
-                    # [코드 수정] 여기서도 limit을 UI 설정값(최대 10)으로 전달
                     res = search_products(ACCESS_KEY, SECRET_KEY, keyword_prod.strip(), limit_prod)
 
                 if isinstance(res, dict) and "data" in res:
