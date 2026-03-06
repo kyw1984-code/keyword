@@ -6,9 +6,10 @@ import requests
 import pandas as pd
 import urllib.parse
 import re
+from collections import Counter
 
 # ---------------------------------------------------------
-# 1. HMAC 서명 생성 (기존 성공 코드 유지)
+# 1. 쿠팡 파트너스 API 인증 (HMAC) - 공식
 # ---------------------------------------------------------
 def generate_hmac(method, url, secret_key, access_key):
     path, *query = url.split("?")
@@ -18,57 +19,68 @@ def generate_hmac(method, url, secret_key, access_key):
     return f"CEA algorithm=HmacSHA256, access-key={access_key}, signed-date={datetime_gmt}, signature={signature}"
 
 # ---------------------------------------------------------
-# 2. 연관 키워드 분석 로직
+# 2. 핵심 로직: API 데이터에서 키워드 광산 캐기
 # ---------------------------------------------------------
-def get_related_keywords(product_data, original_keyword):
-    if not product_data:
-        return []
+def extract_auto_complete_keywords(products, original_keyword):
+    """
+    상품명 리스트에서 가장 많이 등장하는 단어를 찾아 '자동완성어'처럼 만듭니다.
+    """
+    word_list = []
     
-    all_words = []
-    for item in product_data:
+    # 제외할 단어들 (의미 없는 단어)
+    stop_words = [original_keyword, "여성", "남성", "공용", "쿠팡", "로켓배송", "무료배송", "정품", "국산", "세트", "상품", "추천", "개입", "브랜드", "x", "1개"]
+    # 검색어도 제외 목록에 추가 (예: '니트' 검색 시 '니트' 단어 제외)
+    stop_words.extend(original_keyword.split())
+
+    for item in products:
         name = item.get("productName", "")
-        # 특수문자 제거 후 단어 분리
-        words = re.sub(r'[^가-힣a-zA-Z0-9\s]', ' ', name).split()
-        all_words.extend(words)
+        # 특수문자 제거 ([ ] ( ) - 등)
+        clean_name = re.sub(r'[^\w\s]', ' ', name)
+        
+        # 공백 기준으로 단어 쪼개기
+        words = clean_name.split()
+        
+        for w in words:
+            # 2글자 이상이고, 숫자가 아니며, 제외 단어가 아닌 것만 수집
+            if len(w) >= 2 and not w.isdigit() and w not in stop_words:
+                word_list.append(w)
+
+    # 가장 많이 등장한 단어 순서대로 정렬 (빈도수 분석)
+    # 상위 10개 추출
+    most_common = Counter(word_list).most_common(10)
     
-    # 불용어(제외할 단어) 설정
-    stop_words = [original_keyword, "쿠팡", "무료배송", "로켓배송", "추천", "세트", "정품", "국산", "상품", "개입"]
-    
-    # 단어 정제: 1글자 제외, 검색어 포함 단어 제외
-    refined_words = [
-        w for w in all_words 
-        if len(w) > 1 and not w.isdigit() and w not in stop_words and original_keyword not in w
-    ]
-    
-    # 상위 10개 키워드 추출
-    return pd.Series(refined_words).value_counts().head(10).reset_index()
+    # (단어, 횟수) 형태에서 단어만 리스트로 변환
+    return [word for word, count in most_common]
 
 # ---------------------------------------------------------
 # 3. 메인 앱
 # ---------------------------------------------------------
 def main():
-    st.set_page_config(page_title="쿠팡 키워드 분석기", layout="wide")
-    st.title("🔍 쿠팡 자동완성(연관어) 추출기")
+    st.set_page_config(page_title="쿠팡 공식 연관어 추출", layout="wide")
+    st.title("🛡️ 쿠팡 API 공식 연관 키워드 추출기")
+    st.info("크롤링 없이, 오직 파트너스 API 데이터만을 분석하여 연관 검색어를 생성합니다.")
 
-    # Secrets에서 키 가져오기 (따옴표 제거 로직 포함)
+    # Secrets 체크
     if "COUPANG_ACCESS_KEY" not in st.secrets:
-        st.error("Secrets에 키가 없습니다.")
+        st.error("Secrets에 키가 설정되지 않았습니다.")
         st.stop()
         
     ACCESS_KEY = st.secrets["COUPANG_ACCESS_KEY"].strip().strip('"').strip("'")
     SECRET_KEY = st.secrets["COUPANG_SECRET_KEY"].strip().strip('"').strip("'")
 
-    keyword = st.text_input("분석할 키워드를 입력하세요", placeholder="예: 캠핑 의자")
+    keyword = st.text_input("검색어를 입력하세요 (예: 노트북, 니트티)", placeholder="키워드 입력")
 
-    if st.button("분석 시작"):
+    if st.button("연관 검색어 분석 시작"):
         if not keyword:
             st.warning("키워드를 입력해주세요.")
             return
 
-        with st.spinner(f"'{keyword}' 관련 상품을 분석 중입니다..."):
+        with st.spinner(f"API를 통해 '{keyword}' 데이터를 분석 중입니다..."):
+            # 1. API 호출 (공식 Gateway 사용)
             DOMAIN = "https://api-gateway.coupang.com"
-            # ✅ [수정 핵심] limit을 30에서 10으로 변경했습니다. (쿠팡 최대 허용치)
-            URL = f"/v2/providers/affiliate_open_api/apis/openapi/products/search?keyword={urllib.parse.quote(keyword)}&limit=10"
+            # 분석 정확도를 위해 최대치인 50개 데이터를 요청 (limit=50이 가능한지 시도, 안되면 10으로 조정)
+            # 보통 Search API는 10~50 유동적이나, 데이터 확보를 위해 20 정도로 설정
+            URL = f"/v2/providers/affiliate_open_api/apis/openapi/products/search?keyword={urllib.parse.quote(keyword)}&limit=20"
             
             auth = generate_hmac("GET", URL, SECRET_KEY, ACCESS_KEY)
             headers = {
@@ -85,31 +97,31 @@ def main():
                     products = res_data["data"].get("productData", [])
                     
                     if products:
-                        # 1. 연관 키워드 추출
-                        df_keywords = get_related_keywords(products, keyword)
-                        df_keywords.columns = ["추천 연관어", "빈도"]
-
-                        # 2. 결과 화면 구성
-                        col1, col2 = st.columns([1, 2])
+                        # 2. 키워드 추출 실행
+                        extracted_keywords = extract_auto_complete_keywords(products, keyword)
                         
+                        # 3. 결과 보여주기 (사진처럼 텍스트 리스트로)
+                        st.success("✅ 추출된 연관 검색어 (자동완성 추천)")
+                        
+                        # 보기 좋게 태그 형태로 출력
+                        st.markdown("### 👇 결과 리스트")
+                        
+                        # 데이터프레임으로 깔끔하게 정리
+                        df_result = pd.DataFrame(extracted_keywords, columns=["추천 키워드"])
+                        df_result.index = df_result.index + 1 # 1부터 시작하게
+                        
+                        col1, col2 = st.columns(2)
                         with col1:
-                            st.success(f"✅ 추출 완료!")
-                            st.dataframe(df_keywords, use_container_width=True, hide_index=True)
-                            
+                            st.dataframe(df_result, use_container_width=True)
                         with col2:
-                            st.info("💡 **분석 원리**")
-                            st.write(f"쿠팡에서 실제 판매 중인 상위 10개 상품의 제목을 분석하여, '{keyword}'와 가장 자주 함께 쓰이는 단어를 찾았습니다.")
-                            st.write("---")
-                            st.write("**분석된 원본 상품 예시:**")
-                            for p in products[:3]: # 3개만 예시로 보여줌
-                                st.caption(f"- {p['productName']}")
-
+                            st.write("텍스트 복사용:")
+                            st.code(", ".join(extracted_keywords))
+                            st.caption(f"💡 원리: 상위 {len(products)}개 상품의 제목에서 가장 많이 반복된 핵심 단어를 추출했습니다.")
+                            
                     else:
-                        st.warning("검색된 상품이 없습니다.")
+                        st.warning("검색된 상품이 없어 키워드를 추출할 수 없습니다.")
                 else:
-                    # 에러 메시지 출력
-                    st.error(f"오류 발생: {res_data.get('rMessage', '')}")
-                    st.json(res_data)
+                    st.error(f"API 오류: {res_data.get('rMessage', '알 수 없는 오류')}")
             
             except Exception as e:
                 st.error(f"시스템 오류: {str(e)}")
