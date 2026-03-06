@@ -1,144 +1,200 @@
-# app.py
-import json
-import time
-from pathlib import Path
+import datetime as dt
+import hashlib
+import hmac
+from urllib.parse import urlencode
 
-import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="연관검색어 수집기", layout="wide")
-st.title("연관검색어 수집기")
-st.caption("승인된 데이터 소스 또는 사전 확보한 파일만 사용하세요.")
+st.set_page_config(page_title="쿠팡 API 호출기", layout="wide")
+st.title("쿠팡 API 호출기")
+st.caption("공식적으로 승인된 쿠팡 API 엔드포인트만 사용하세요.")
 
-st.sidebar.header("입력 방식")
-mode = st.sidebar.radio(
-    "데이터 소스 선택",
-    ["승인된 API", "JSON 파일 업로드", "CSV 파일 업로드"],
+BASE_URL = "https://api-gateway.coupang.com"
+
+ACCESS_KEY = st.secrets.get("COUPANG_ACCESS_KEY", "")
+SECRET_KEY = st.secrets.get("COUPANG_SECRET_KEY", "")
+DEFAULT_PATH = st.secrets.get("COUPANG_ENDPOINT_PATH", "")
+
+if not ACCESS_KEY or not SECRET_KEY:
+    st.error("Streamlit secrets에 COUPANG_ACCESS_KEY, COUPANG_SECRET_KEY가 필요합니다.")
+    st.stop()
+
+
+def make_authorization(method: str, path: str, query_string: str = "") -> str:
+    """
+    Coupang OpenAPI HMAC Authorization 생성
+    공식 문서 형식:
+    CEA algorithm=HmacSHA256, access-key=..., signed-date=..., signature=...
+    """
+    method = method.upper()
+    signed_date = dt.datetime.utcnow().strftime("%y%m%dT%H%M%SZ")
+    message = f"{signed_date}{method}{path}{query_string}"
+
+    signature = hmac.new(
+        SECRET_KEY.encode("utf-8"),
+        message.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+    authorization = (
+        f"CEA algorithm=HmacSHA256, "
+        f"access-key={ACCESS_KEY}, "
+        f"signed-date={signed_date}, "
+        f"signature={signature}"
+    )
+    return authorization
+
+
+def coupang_get(path: str, params: dict | None = None, timeout: int = 20):
+    params = params or {}
+    query_string = urlencode(params, doseq=True)
+
+    headers = {
+        "Content-Type": "application/json;charset=UTF-8",
+        "Authorization": make_authorization("GET", path, query_string),
+    }
+
+    url = f"{BASE_URL}{path}"
+    return requests.get(url, headers=headers, params=params, timeout=timeout)
+
+
+def flatten_response(keyword: str, data):
+    """
+    응답 구조를 모를 때 화면 표시용으로 최대한 평탄화
+    """
+    rows = []
+
+    if isinstance(data, list):
+        for i, item in enumerate(data, start=1):
+            if isinstance(item, dict):
+                row = {"keyword": keyword, "rank": i}
+                for k, v in item.items():
+                    row[k] = str(v)
+                rows.append(row)
+            else:
+                rows.append({"keyword": keyword, "rank": i, "value": str(item)})
+
+    elif isinstance(data, dict):
+        # 흔한 배열 후보 탐색
+        list_found = None
+        for key in ["data", "results", "items", "products", "suggestions", "keywords"]:
+            if isinstance(data.get(key), list):
+                list_found = data[key]
+                break
+
+        if list_found is not None:
+            return flatten_response(keyword, list_found)
+
+        rows.append({"keyword": keyword, "value": str(data)})
+
+    else:
+        rows.append({"keyword": keyword, "value": str(data)})
+
+    return rows
+
+
+with st.sidebar:
+    st.header("설정")
+    endpoint_path = st.text_input(
+        "엔드포인트 Path",
+        value=DEFAULT_PATH,
+        placeholder="/v2/providers/affiliate_open_api/apis/openapi/v1/..."
+    )
+    show_raw = st.checkbox("원본 응답 보기", value=True)
+
+st.write("키워드를 줄바꿈으로 입력하세요.")
+keywords_text = st.text_area(
+    "키워드 입력",
+    placeholder="예:\n노트북\n텀블러\n무선이어폰",
+    height=180
 )
 
-def normalize_rows(rows):
-    normalized = []
-    for row in rows:
-        keyword = row.get("keyword", "")
-        suggestions = row.get("suggestions", [])
-        if isinstance(suggestions, str):
-            suggestions = [suggestions]
-        for rank, s in enumerate(suggestions, start=1):
-            normalized.append({
-                "keyword": keyword,
-                "rank": rank,
-                "suggestion": s
-            })
-    return pd.DataFrame(normalized)
+# 필요시 직접 추가 파라미터 입력
+st.subheader("추가 쿼리 파라미터")
+param_text = st.text_area(
+    "key=value 형식, 한 줄에 하나씩",
+    placeholder="limit=10\nsubId=mytest",
+    height=120
+)
 
-def call_approved_api(base_url: str, api_key: str, keywords: list[str], sleep_sec: float):
-    results = []
-    session = requests.Session()
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json",
-        "User-Agent": "approved-client/1.0",
-    }
+extra_params = {}
+for line in param_text.splitlines():
+    line = line.strip()
+    if not line or "=" not in line:
+        continue
+    k, v = line.split("=", 1)
+    extra_params[k.strip()] = v.strip()
+
+keywords = [x.strip() for x in keywords_text.splitlines() if x.strip()]
+
+if st.button("실행", type="primary"):
+    if not endpoint_path:
+        st.error("엔드포인트 Path를 입력하세요.")
+        st.stop()
+
+    if not keywords:
+        st.error("키워드를 1개 이상 입력하세요.")
+        st.stop()
+
+    all_rows = []
+    raw_results = []
 
     progress = st.progress(0)
     status = st.empty()
 
-    for i, kw in enumerate(keywords, start=1):
-        status.write(f"조회 중: {kw} ({i}/{len(keywords)})")
+    for i, keyword in enumerate(keywords, start=1):
+        status.write(f"호출 중: {keyword} ({i}/{len(keywords)})")
+
+        params = {"keyword": keyword}
+        params.update(extra_params)
+
         try:
-            resp = session.get(
-                base_url,
-                params={"q": kw},
-                headers=headers,
-                timeout=15,
-            )
+            resp = coupang_get(endpoint_path, params=params)
+            content_type = resp.headers.get("Content-Type", "")
 
-            if resp.status_code == 429:
-                st.warning(f"속도 제한 감지: {kw} 에서 중단했습니다.")
-                break
+            try:
+                data = resp.json()
+            except Exception:
+                data = resp.text
 
-            resp.raise_for_status()
-            data = resp.json()
-
-            # 예시 응답 형식:
-            # {"keyword":"노트북","suggestions":["노트북 파우치","노트북 거치대"]}
-            results.append({
-                "keyword": data.get("keyword", kw),
-                "suggestions": data.get("suggestions", []),
+            raw_results.append({
+                "keyword": keyword,
+                "status_code": resp.status_code,
+                "response": data
             })
 
+            if resp.ok:
+                all_rows.extend(flatten_response(keyword, data))
+            else:
+                all_rows.append({
+                    "keyword": keyword,
+                    "error": f"HTTP {resp.status_code}",
+                    "response": str(data)
+                })
+
         except requests.RequestException as e:
-            st.error(f"{kw} 조회 실패: {e}")
-            results.append({
-                "keyword": kw,
-                "suggestions": [],
+            all_rows.append({
+                "keyword": keyword,
+                "error": str(e)
             })
 
         progress.progress(i / len(keywords))
-        time.sleep(sleep_sec)
 
-    return results
+    st.subheader("정리 결과")
+    if all_rows:
+        st.dataframe(all_rows, use_container_width=True)
 
-keywords_text = st.text_area(
-    "키워드 입력",
-    placeholder="예:\n노트북\n텀블러\n무선이어폰",
-    height=180,
-)
-
-keywords = [x.strip() for x in keywords_text.splitlines() if x.strip()]
-
-if mode == "승인된 API":
-    st.subheader("승인된 API 사용")
-    base_url = st.text_input("API URL", placeholder="https://your-approved-endpoint.example.com/suggest")
-    api_key = st.text_input("API Key", type="password")
-    sleep_sec = st.number_input("호출 간격(초)", min_value=0.5, max_value=10.0, value=1.0, step=0.5)
-
-    if st.button("조회 시작", type="primary"):
-        if not base_url or not api_key or not keywords:
-            st.error("API URL, API Key, 키워드를 모두 입력하세요.")
-        else:
-            rows = call_approved_api(base_url, api_key, keywords, sleep_sec)
-            df = normalize_rows(rows)
-            st.dataframe(df, use_container_width=True)
-
-            csv = df.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                "CSV 다운로드",
-                data=csv,
-                file_name="suggestions.csv",
-                mime="text/csv",
-            )
-
-elif mode == "JSON 파일 업로드":
-    st.subheader("JSON 업로드")
-    uploaded = st.file_uploader("JSON 파일 선택", type=["json"])
-    if uploaded:
-        data = json.load(uploaded)
-        if isinstance(data, dict):
-            data = [data]
-        df = normalize_rows(data)
-        st.dataframe(df, use_container_width=True)
-
+        import pandas as pd
+        df = pd.DataFrame(all_rows)
         csv = df.to_csv(index=False).encode("utf-8-sig")
         st.download_button(
             "CSV 다운로드",
             data=csv,
-            file_name="suggestions_from_json.csv",
+            file_name="coupang_api_result.csv",
             mime="text/csv",
         )
 
-elif mode == "CSV 파일 업로드":
-    st.subheader("CSV 업로드")
-    uploaded = st.file_uploader("CSV 파일 선택", type=["csv"])
-    if uploaded:
-        df = pd.read_csv(uploaded)
-        st.dataframe(df, use_container_width=True)
-
-        csv = df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            "CSV 다운로드",
-            data=csv,
-            file_name="suggestions_from_csv.csv",
-            mime="text/csv",
-        )
+    if show_raw:
+        st.subheader("원본 응답")
+        st.json(raw_results)
