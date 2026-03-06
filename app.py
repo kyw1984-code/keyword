@@ -27,9 +27,7 @@ def search_products(access_key, secret_key, keyword, limit=10):
     DOMAIN = "https://api-gateway.coupang.com"
     encoded_keyword = urllib.parse.quote(keyword)
     
-    # [핵심 수정] 
-    # 분석 함수에서 20개를 요청하더라도, 여기서는 API 에러 방지를 위해 
-    # 무조건 10개 이하로 강제 조정합니다.
+    # 안전장치: 10개 고정
     safe_limit = 10 if int(limit) > 10 else int(limit)
     
     URL = f"/v2/providers/affiliate_open_api/apis/openapi/products/search?keyword={encoded_keyword}&limit={safe_limit}"
@@ -45,7 +43,6 @@ def search_products(access_key, secret_key, keyword, limit=10):
         if response.status_code == 200:
             return response.json()
         else:
-            # 에러 발생 시 원인을 파악하기 위해 상세 내용 반환
             return {"error": True, "code": response.status_code, "msg": response.text}
     except Exception as e:
         return {"error": True, "msg": str(e)}
@@ -94,7 +91,7 @@ def extract_hybrid_keywords(base_keyword, product_names):
     return final_keywords[:10]
 
 # ---------------------------------------------------------
-# 3. 시장 분석 로직 (에러 처리 강화)
+# 3. 시장 분석 로직
 # ---------------------------------------------------------
 def analyze_market(access_key, secret_key, keyword_list):
     report = []
@@ -107,7 +104,6 @@ def analyze_market(access_key, secret_key, keyword_list):
         status_text.text(f"🔍 분석 중... '{kw}' ({i+1}/{total})")
         progress_bar.progress((i + 1) / total)
         
-        # [수정] limit을 10으로 명시적 호출
         res = search_products(access_key, secret_key, kw, limit=10)
         
         if res and "data" in res:
@@ -129,11 +125,9 @@ def analyze_market(access_key, secret_key, keyword_list):
                 "대표상품": products[0]['productName'] if products else "-"
             })
         else:
-            # [디버깅] 만약 에러가 나면 화면에 작게 출력해서 원인을 알림
             if res and "error" in res:
                 st.toast(f"⚠️ '{kw}' 검색 실패: {res.get('msg', '알 수 없는 오류')}")
         
-        # API 부하 방지 (1초로 늘림)
         sleep(1.0)
         
     status_text.text("✅ 분석 완료!")
@@ -176,12 +170,11 @@ def main():
             return
 
         with st.spinner("1단계: 연관 키워드를 수집하고 있습니다..."):
-            # 여기서도 limit 10 고정
             res = search_products(ACCESS_KEY, SECRET_KEY, main_keyword, 10)
             
             if not res or "data" not in res:
                 st.error("API 호출 오류가 발생했습니다.")
-                st.json(res) # 상세 에러 출력
+                st.write(res)
                 st.stop()
                 
             product_names = [p['productName'] for p in res["data"].get("productData", [])]
@@ -198,17 +191,17 @@ def main():
             if not df_report.empty:
                 st.subheader("📊 분석 리포트")
                 
-                # 데이터 포맷팅 및 스타일링
-                # (이전 오류 해결된 버전)
+                # [수정] background_gradient 제거 (matplotlib 의존성 해결)
+                # 단순히 숫자 포맷(천단위 콤마, 소수점)만 적용합니다.
                 format_dict = {
                     "평균가격": "{:,.0f}원", 
                     "로켓배송 비율(%)": "{:.1f}%"
                 }
                 
-                styled_df = df_report.style.format(format_dict)\
-                                           .background_gradient(subset=["로켓배송 비율(%)"], cmap="Greens")
-                
-                st.dataframe(styled_df, use_container_width=True)
+                st.dataframe(
+                    df_report.style.format(format_dict), 
+                    use_container_width=True
+                )
                 
                 # 인사이트 도출
                 best_rocket = df_report.loc[df_report["로켓배송 비율(%)"].idxmax()]
@@ -227,8 +220,7 @@ def main():
                     file_name=f"황금키워드분석_{main_keyword}.xlsx"
                 )
             else:
-                st.error("분석된 데이터가 없습니다. (API 호출 실패)")
-                st.write("가능성: 너무 빠른 호출로 인한 일시적 차단, 또는 한도 초과")
+                st.error("분석된 데이터가 없습니다.")
         else:
             st.warning("연관 키워드를 찾지 못했습니다.")
 
