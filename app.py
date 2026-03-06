@@ -7,7 +7,9 @@ import pandas as pd
 import urllib.parse
 import re
 
-# 1. HMAC 서명 생성 함수
+# ---------------------------------------------------------
+# 1. HMAC 서명 생성 (기존 성공 코드 유지)
+# ---------------------------------------------------------
 def generate_hmac(method, url, secret_key, access_key):
     path, *query = url.split("?")
     datetime_gmt = strftime('%y%m%d', gmtime()) + 'T' + strftime('%H%M%S', gmtime()) + 'Z'
@@ -15,7 +17,9 @@ def generate_hmac(method, url, secret_key, access_key):
     signature = hmac.new(bytes(secret_key, "utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"CEA algorithm=HmacSHA256, access-key={access_key}, signed-date={datetime_gmt}, signature={signature}"
 
-# 2. 상품명에서 연관 키워드를 추출 및 정제하는 함수
+# ---------------------------------------------------------
+# 2. 연관 키워드 분석 로직
+# ---------------------------------------------------------
 def get_related_keywords(product_data, original_keyword):
     if not product_data:
         return []
@@ -23,40 +27,48 @@ def get_related_keywords(product_data, original_keyword):
     all_words = []
     for item in product_data:
         name = item.get("productName", "")
-        # 한글, 영문, 숫자만 남기고 제거 후 공백 단위로 분리
+        # 특수문자 제거 후 단어 분리
         words = re.sub(r'[^가-힣a-zA-Z0-9\s]', ' ', name).split()
         all_words.extend(words)
     
-    # 1글자 단어, 숫자만 있는 단어, 원본 키워드와 겹치는 단어 제외
-    stop_words = [original_keyword, "쿠팡", "정품", "무료배송", "로켓배송", "추천"]
+    # 불용어(제외할 단어) 설정
+    stop_words = [original_keyword, "쿠팡", "무료배송", "로켓배송", "추천", "세트", "정품", "국산", "상품", "개입"]
+    
+    # 단어 정제: 1글자 제외, 검색어 포함 단어 제외
     refined_words = [
         w for w in all_words 
         if len(w) > 1 and not w.isdigit() and w not in stop_words and original_keyword not in w
     ]
     
-    # 빈도수 계산 후 상위 15개 반환
-    return pd.Series(refined_words).value_counts().head(15).reset_index()
+    # 상위 10개 키워드 추출
+    return pd.Series(refined_words).value_counts().head(10).reset_index()
 
+# ---------------------------------------------------------
 # 3. 메인 앱
+# ---------------------------------------------------------
 def main():
-    st.set_page_config(page_title="쿠팡 연관어 추출기", layout="wide")
-    st.title("🔍 쿠팡 파트너스 기반 연관 검색어 생성기")
+    st.set_page_config(page_title="쿠팡 키워드 분석기", layout="wide")
+    st.title("🔍 쿠팡 자동완성(연관어) 추출기")
 
-    # 키 설정 (따옴표 제거 로직 포함)
+    # Secrets에서 키 가져오기 (따옴표 제거 로직 포함)
+    if "COUPANG_ACCESS_KEY" not in st.secrets:
+        st.error("Secrets에 키가 없습니다.")
+        st.stop()
+        
     ACCESS_KEY = st.secrets["COUPANG_ACCESS_KEY"].strip().strip('"').strip("'")
     SECRET_KEY = st.secrets["COUPANG_SECRET_KEY"].strip().strip('"').strip("'")
 
-    keyword = st.text_input("메인 키워드를 입력하세요", placeholder="예: 여성 니트티")
+    keyword = st.text_input("분석할 키워드를 입력하세요", placeholder="예: 캠핑 의자")
 
-    if st.button("연관 검색어 추출"):
+    if st.button("분석 시작"):
         if not keyword:
             st.warning("키워드를 입력해주세요.")
             return
 
-        with st.spinner("상품 정보를 분석하여 연관어를 뽑아내고 있습니다..."):
+        with st.spinner(f"'{keyword}' 관련 상품을 분석 중입니다..."):
             DOMAIN = "https://api-gateway.coupang.com"
-            # 분석 데이터 확보를 위해 limit을 20~30으로 설정하는 것이 좋습니다.
-            URL = f"/v2/providers/affiliate_open_api/apis/openapi/products/search?keyword={urllib.parse.quote(keyword)}&limit=30"
+            # ✅ [수정 핵심] limit을 30에서 10으로 변경했습니다. (쿠팡 최대 허용치)
+            URL = f"/v2/providers/affiliate_open_api/apis/openapi/products/search?keyword={urllib.parse.quote(keyword)}&limit=10"
             
             auth = generate_hmac("GET", URL, SECRET_KEY, ACCESS_KEY)
             headers = {
@@ -73,28 +85,31 @@ def main():
                     products = res_data["data"].get("productData", [])
                     
                     if products:
-                        # --- 연관어 추출 로직 실행 ---
+                        # 1. 연관 키워드 추출
                         df_keywords = get_related_keywords(products, keyword)
-                        df_keywords.columns = ["연관 키워드", "추출 빈도(점수)"]
+                        df_keywords.columns = ["추천 연관어", "빈도"]
 
-                        st.success(f"✅ '{keyword}' 분석 완료! 가장 연관성이 높은 단어들입니다.")
+                        # 2. 결과 화면 구성
+                        col1, col2 = st.columns([1, 2])
                         
-                        # 화면에 키워드 리스트 보여주기
-                        col1, col2 = st.columns([1, 1])
                         with col1:
-                            st.subheader("🔥 연관어 추천 순위")
+                            st.success(f"✅ 추출 완료!")
                             st.dataframe(df_keywords, use_container_width=True, hide_index=True)
-                        
+                            
                         with col2:
-                            st.subheader("💡 활용 팁")
-                            st.write("1. **블로그 제목**: 메인 키워드와 추천 연관어를 조합하세요.")
-                            st.write("2. **태그 구성**: 추출 빈도가 높은 순서대로 해시태그를 작성하세요.")
-                            st.write("3. **상세페이지**: 고객들이 많이 검색하는 속성 단어들입니다.")
+                            st.info("💡 **분석 원리**")
+                            st.write(f"쿠팡에서 실제 판매 중인 상위 10개 상품의 제목을 분석하여, '{keyword}'와 가장 자주 함께 쓰이는 단어를 찾았습니다.")
+                            st.write("---")
+                            st.write("**분석된 원본 상품 예시:**")
+                            for p in products[:3]: # 3개만 예시로 보여줌
+                                st.caption(f"- {p['productName']}")
+
                     else:
-                        st.warning("검색 결과 상품이 없어 분석이 불가능합니다.")
+                        st.warning("검색된 상품이 없습니다.")
                 else:
-                    st.error(f"API 응답 오류: {res_data.get('message', '알 수 없는 에러')}")
-                    st.json(res_data) # 에러 내용 상세 확인용
+                    # 에러 메시지 출력
+                    st.error(f"오류 발생: {res_data.get('rMessage', '')}")
+                    st.json(res_data)
             
             except Exception as e:
                 st.error(f"시스템 오류: {str(e)}")
